@@ -63,7 +63,7 @@
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/youruser/security-research-platform
+git clone https://github.com/KKOCAER/Security-Scientist
 cd security-research-platform
 
 # Full lab (requires ~16 GB RAM)
