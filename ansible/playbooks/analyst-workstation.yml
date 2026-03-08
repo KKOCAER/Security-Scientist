@@ -1,0 +1,203 @@
+---
+# =============================================================
+#  Playbook: analyst-workstation.yml
+#  Ghidra, Radare2/Cutter, GDB+pwndbg, pwntools, Volatility3
+# =============================================================
+
+- name: Deploy Security Analyst Workstation
+  hosts: analyst
+  become: true
+  vars:
+    ghidra_version:  "11.0.3"
+    ghidra_dir:      /opt/ghidra
+    tools_dir:       /opt/sectools
+    analyst_user:    vagrant
+
+  tasks:
+    # ── Core packages ─────────────────────────────────────────
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-dev
+          - git
+          - build-essential
+          - cmake
+          - nasm
+          - gdb
+          - ltrace
+          - strace
+          - binutils
+          - binwalk
+          - file
+          - hexedit
+          - xxd
+          - exiftool
+          - strings
+          - upx-ucl
+          - openjdk-17-jdk
+          - curl
+          - wget
+          - unzip
+          - yara
+          - ssdeep
+          - libssl-dev
+          - libffi-dev
+          - libpcap-dev
+          - wireshark-common
+          - tshark
+          - foremost
+          - sleuthkit
+        state: present
+        update_cache: true
+
+    # ── Ghidra ────────────────────────────────────────────────
+    - name: Download Ghidra {{ ghidra_version }}
+      ansible.builtin.get_url:
+        url: "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_{{ ghidra_version }}_build/ghidra_{{ ghidra_version }}_PUBLIC_20240410.zip"
+        dest: /tmp/ghidra.zip
+        timeout: 120
+      ignore_errors: true
+
+    - name: Install Ghidra
+      ansible.builtin.unarchive:
+        src: /tmp/ghidra.zip
+        dest: /opt/
+        remote_src: true
+      ignore_errors: true
+
+    - name: Symlink Ghidra
+      ansible.builtin.file:
+        src: "/opt/ghidra_{{ ghidra_version }}_PUBLIC"
+        dest: "{{ ghidra_dir }}"
+        state: link
+      ignore_errors: true
+
+    - name: Create ghidra launcher
+      ansible.builtin.copy:
+        dest: /usr/local/bin/ghidra
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          exec {{ ghidra_dir }}/ghidraRun "$@"
+
+    # ── Radare2 + Cutter ──────────────────────────────────────
+    - name: Install Radare2
+      ansible.builtin.shell:
+        cmd: |
+          git clone --depth 1 https://github.com/radareorg/radare2 /tmp/radare2
+          cd /tmp/radare2
+          sys/install.sh
+      args:
+        creates: /usr/local/bin/r2
+      ignore_errors: true
+
+    - name: Install r2 Python bindings
+      ansible.builtin.pip:
+        name: r2pipe
+        state: present
+
+    # ── GDB + pwndbg ──────────────────────────────────────────
+    - name: Clone pwndbg
+      ansible.builtin.git:
+        repo: https://github.com/pwndbg/pwndbg.git
+        dest: /opt/pwndbg
+        depth: 1
+
+    - name: Install pwndbg
+      ansible.builtin.command:
+        cmd: bash setup.sh
+        chdir: /opt/pwndbg
+        creates: /opt/pwndbg/pwndbg.so
+      environment:
+        PWNDBG_NO_AUTOUPDATE: "1"
+      ignore_errors: true
+
+    - name: Configure GDB to load pwndbg
+      ansible.builtin.blockinfile:
+        path: "/home/{{ analyst_user }}/.gdbinit"
+        create: true
+        block: |
+          source /opt/pwndbg/gdbinit.py
+          set disassembly-flavor intel
+          set pagination off
+
+    # ── pwntools ──────────────────────────────────────────────
+    - name: Install pwntools and exploit helpers
+      ansible.builtin.pip:
+        name:
+          - pwntools
+          - ROPgadget
+          - one_gadget
+          - checksec
+          - angr
+          - keystone-engine
+          - capstone
+          - unicorn
+          - frida-tools
+        state: present
+
+    # ── Volatility3 ───────────────────────────────────────────
+    - name: Clone Volatility3
+      ansible.builtin.git:
+        repo: https://github.com/volatilityfoundation/volatility3.git
+        dest: /opt/volatility3
+        version: stable
+        depth: 1
+
+    - name: Install Volatility3 deps
+      ansible.builtin.pip:
+        requirements: /opt/volatility3/requirements.txt
+        state: present
+
+    - name: Symlink vol3
+      ansible.builtin.file:
+        src: /opt/volatility3/vol.py
+        dest: /usr/local/bin/vol3
+        state: link
+
+    # ── YARA ──────────────────────────────────────────────────
+    - name: Install YARA Python bindings
+      ansible.builtin.pip:
+        name:
+          - yara-python
+          - oletools
+          - pefile
+          - python-magic
+          - pyelftools
+        state: present
+
+    # ── ROPgadget + checksec ──────────────────────────────────
+    - name: Create tools directory
+      ansible.builtin.file:
+        path: "{{ tools_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ── Frida ─────────────────────────────────────────────────
+    - name: Install Frida
+      ansible.builtin.pip:
+        name:
+          - frida
+          - frida-tools
+        state: present
+
+    # ── Clone research scripts ────────────────────────────────
+    - name: Symlink reverse engineering scripts
+      ansible.builtin.file:
+        src: /vagrant/reverse-engineering/scripts
+        dest: "{{ tools_dir }}/re-scripts"
+        state: link
+
+    - name: Show installed tools
+      ansible.builtin.debug:
+        msg:
+          - "Ghidra    → ghidra"
+          - "Radare2   → r2 / cutter"
+          - "GDB       → gdb (pwndbg loaded)"
+          - "pwntools  → python3 -c 'from pwn import *'"
+          - "Volatility→ vol3"
+          - "YARA      → yara"
+          - "ROPgadget → ROPgadget"
+          - "Frida     → frida"

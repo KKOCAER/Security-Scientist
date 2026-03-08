@@ -1,0 +1,198 @@
+---
+# =============================================================
+#  Playbook: sandbox.yml
+#  Deploys CAPE Sandbox + INetSim for dynamic malware analysis
+# =============================================================
+
+- name: Deploy Malware Analysis Sandbox
+  hosts: sandbox
+  become: true
+  vars:
+    cape_dir:      /opt/CAPEv2
+    cape_user:     cape
+    inetsim_dir:   /etc/inetsim
+    fakenet_dir:   /opt/fakenet-ng
+    cape_port:     8000
+
+  tasks:
+    # ── Network Isolation ─────────────────────────────────────
+    - name: Set default forward policy to DROP (isolate sandbox)
+      ansible.builtin.iptables:
+        chain:  FORWARD
+        policy: DROP
+
+    - name: Allow established connections
+      ansible.builtin.iptables:
+        chain:     INPUT
+        ctstate:   [ESTABLISHED, RELATED]
+        jump:      ACCEPT
+
+    - name: Block sandbox outbound to real internet
+      ansible.builtin.iptables:
+        chain:            OUTPUT
+        destination:      "!10.10.30.0/24"
+        out_interface:    eth0
+        jump:             DROP
+        comment:          "Sandbox cannot reach real internet"
+
+    # ── INetSim (fake internet services) ─────────────────────
+    - name: Install INetSim
+      ansible.builtin.apt:
+        name:
+          - inetsim
+          - dnsmasq
+        state: present
+        update_cache: true
+
+    - name: Configure INetSim
+      ansible.builtin.template:
+        src: ../roles/sandbox/templates/inetsim.conf.j2
+        dest: /etc/inetsim/inetsim.conf
+        mode: "0644"
+      notify: Restart INetSim
+
+    - name: Configure dnsmasq for inetsim
+      ansible.builtin.copy:
+        dest: /etc/dnsmasq.d/inetsim.conf
+        content: |
+          # Redirect all DNS to INetSim
+          address=/#/10.10.30.10
+          interface=eth1
+          no-resolv
+        mode: "0644"
+      notify: Restart dnsmasq
+
+    - name: Enable INetSim
+      ansible.builtin.systemd:
+        name: inetsim
+        enabled: true
+        state: started
+
+    # ── CAPE v2 ───────────────────────────────────────────────
+    - name: Install CAPE dependencies
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - git
+          - libssl-dev
+          - libffi-dev
+          - libpq-dev
+          - postgresql
+          - postgresql-client
+          - redis-server
+          - tcpdump
+          - apparmor-utils
+          - yara
+          - ssdeep
+          - libfuzzy-dev
+          - p7zip-full
+          - unrar
+          - docker.io
+        state: present
+
+    - name: Create CAPE user
+      ansible.builtin.user:
+        name: "{{ cape_user }}"
+        groups: [docker, pcap]
+        shell: /bin/bash
+        create_home: true
+
+    - name: Clone CAPEv2
+      ansible.builtin.git:
+        repo: https://github.com/kevoreilly/CAPEv2.git
+        dest: "{{ cape_dir }}"
+        depth: 1
+
+    - name: Install CAPE Python requirements
+      ansible.builtin.pip:
+        requirements: "{{ cape_dir }}/requirements.txt"
+        state: present
+
+    - name: Deploy CAPE config
+      ansible.builtin.template:
+        src: ../roles/sandbox/templates/cape.conf.j2
+        dest: "{{ cape_dir }}/conf/cape.conf"
+        owner: "{{ cape_user }}"
+        mode: "0640"
+
+    - name: Set up PostgreSQL for CAPE
+      ansible.builtin.command:
+        cmd: >-
+          sudo -u postgres psql -c
+          "CREATE USER cape WITH PASSWORD 'cape2024';
+           CREATE DATABASE capedb OWNER cape;"
+      changed_when: true
+      ignore_errors: true  # May already exist
+
+    - name: Initialize CAPE database
+      ansible.builtin.command:
+        cmd: "python3 {{ cape_dir }}/utils/db_migration/migrate.py"
+      become_user: "{{ cape_user }}"
+      changed_when: true
+      ignore_errors: true
+
+    - name: Deploy CAPE web systemd service
+      ansible.builtin.template:
+        src: ../roles/sandbox/templates/cape-web.service.j2
+        dest: /etc/systemd/system/cape-web.service
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart CAPE web
+
+    - name: Deploy CAPE rooter service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cape-rooter.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CAPE Rooter
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/bin/python3 {{ cape_dir }}/rooter.py -g cape
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start CAPE services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - cape-rooter
+        - cape-web
+
+    - name: Print access info
+      ansible.builtin.debug:
+        msg:
+          - "CAPE Web UI → http://10.10.30.10:{{ cape_port }}"
+          - "INetSim → active on eth1 (10.10.30.10)"
+          - "⚠️  Sandbox is NETWORK ISOLATED from internet"
+
+  handlers:
+    - name: Restart INetSim
+      ansible.builtin.systemd:
+        name: inetsim
+        state: restarted
+
+    - name: Restart dnsmasq
+      ansible.builtin.systemd:
+        name: dnsmasq
+        state: restarted
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart CAPE web
+      ansible.builtin.systemd:
+        name: cape-web
+        state: restarted

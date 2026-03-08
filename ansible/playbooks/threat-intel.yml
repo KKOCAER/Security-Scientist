@@ -1,0 +1,137 @@
+---
+# =============================================================
+#  Playbook: threat-intel.yml
+#  Deploys MISP + TheHive + Cortex for threat intelligence
+# =============================================================
+
+- name: Deploy Threat Intelligence Platform
+  hosts: threat_intel
+  become: true
+  vars:
+    misp_url:          "https://10.10.30.30"
+    misp_admin_email:  "admin@secresearch.lab"
+    misp_admin_pass:   "SecResearch2024!"
+    thehive_port:      9000
+    opencti_port:      8080
+    cortex_port:       9001
+
+  tasks:
+    # ── Common dependencies ───────────────────────────────────
+    - name: Install dependencies
+      ansible.builtin.apt:
+        name:
+          - curl
+          - git
+          - gnupg
+          - apt-transport-https
+          - ca-certificates
+          - docker.io
+          - docker-compose
+          - python3
+          - python3-pip
+        state: present
+        update_cache: true
+
+    - name: Enable Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    # ── MISP (via Docker Compose) ─────────────────────────────
+    - name: Create MISP directory
+      ansible.builtin.file:
+        path: /opt/misp
+        state: directory
+        mode: "0755"
+
+    - name: Deploy MISP docker-compose
+      ansible.builtin.template:
+        src: ../roles/threat-intel/templates/misp-docker-compose.yml.j2
+        dest: /opt/misp/docker-compose.yml
+        mode: "0644"
+
+    - name: Deploy MISP environment config
+      ansible.builtin.template:
+        src: ../roles/threat-intel/templates/misp.env.j2
+        dest: /opt/misp/.env
+        mode: "0600"
+
+    - name: Start MISP
+      ansible.builtin.command:
+        cmd: docker-compose up -d
+        chdir: /opt/misp
+      changed_when: true
+
+    - name: Wait for MISP to initialize
+      ansible.builtin.wait_for:
+        host: localhost
+        port: 443
+        timeout: 300
+
+    # ── TheHive 5 + Cortex (Docker Compose) ──────────────────
+    - name: Create TheHive directory
+      ansible.builtin.file:
+        path: /opt/thehive
+        state: directory
+        mode: "0755"
+
+    - name: Deploy TheHive docker-compose
+      ansible.builtin.template:
+        src: ../roles/threat-intel/templates/thehive-docker-compose.yml.j2
+        dest: /opt/thehive/docker-compose.yml
+        mode: "0644"
+
+    - name: Start TheHive + Cortex
+      ansible.builtin.command:
+        cmd: docker-compose up -d
+        chdir: /opt/thehive
+      changed_when: true
+
+    - name: Wait for TheHive
+      ansible.builtin.wait_for:
+        host: localhost
+        port: "{{ thehive_port }}"
+        timeout: 180
+
+    # ── MISP → TheHive connector ──────────────────────────────
+    - name: Install PyMISP + TheHive4py
+      ansible.builtin.pip:
+        name:
+          - pymisp
+          - thehive4py
+          - stix2
+          - taxii2-client
+          - requests
+          - pyyaml
+        state: present
+
+    # ── Threat feed automation ────────────────────────────────
+    - name: Deploy feed sync scripts
+      ansible.builtin.copy:
+        src: ../../threat-intelligence/scripts/
+        dest: /opt/ti-scripts/
+        mode: "0755"
+
+    - name: Deploy feed sync cron jobs
+      ansible.builtin.cron:
+        name: "{{ item.name }}"
+        minute: "{{ item.minute }}"
+        hour:   "{{ item.hour }}"
+        job:    "{{ item.job }}"
+      loop:
+        - name:   "Sync MISP feeds"
+          minute: "0"
+          hour:   "*/6"
+          job:    "python3 /opt/ti-scripts/sync_feeds.py >> /var/log/ti-sync.log 2>&1"
+        - name:   "Pull OTX IOCs"
+          minute: "30"
+          hour:   "*/12"
+          job:    "python3 /opt/ti-scripts/otx_pull.py >> /var/log/ti-sync.log 2>&1"
+
+    - name: Print access info
+      ansible.builtin.debug:
+        msg:
+          - "MISP     → https://10.10.30.30"
+          - "TheHive  → http://10.10.30.30:{{ thehive_port }}"
+          - "Cortex   → http://10.10.30.30:{{ cortex_port }}"

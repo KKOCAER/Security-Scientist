@@ -1,0 +1,46 @@
+# Security Research Platform — Ansible Inventory
+
+[sandbox]
+sandbox ansible_host=10.10.30.10 ansible_user=vagrant ansible_ssh_private_key_file=~/.vagrant.d/insecure_private_key
+
+[analyst]
+analyst ansible_host=10.10.30.20 ansible_user=vagrant ansible_ssh_private_key_file=~/.vagrant.d/insecure_private_key
+
+[threat_intel]
+threat-intel ansible_host=10.10.30.30 ansible_user=vagrant ansible_ssh_private_key_file=~/.vagrant.d/insecure_private_key
+
+[vuln_research]
+vuln-research ansible_host=10.10.30.40 ansible_user=vagrant ansible_ssh_private_key_file=~/.vagrant.d/insecure_private_key
+
+[all_nodes:children]
+sandbox
+analyst
+threat_intel
+vuln_research
+
+[all_nodes:vars]
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+lab_network=10.10.30.0/24
+
+[sandbox:vars]
+inetsim_iface=eth1
+cape_port=8000
+fake_internet=true
+network_isolation=true
+
+[threat_intel:vars]
+misp_port=443
+thehive_port=9000
+opencti_port=8080
+misp_admin_email=admin@secresearch.lab
+misp_admin_pass=SecResearch2024!
+
+[analyst:vars]
+ghidra_version=11.0.3
+ghidra_install=/opt/ghidra
+radare2_version=5.8.8
+
+[vuln_research:vars]
+afl_cores=4
+asan_enabled=true

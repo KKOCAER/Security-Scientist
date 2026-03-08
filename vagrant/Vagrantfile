@@ -1,0 +1,126 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# =============================================================
+#  Security Research Platform — Vagrantfile
+#  VMs: sandbox, analyst, threat-intel, vuln-research
+# =============================================================
+
+VAGRANTFILE_API_VERSION = "2"
+
+MACHINES = {
+  "sandbox" => {
+    box:         "ubuntu/jammy64",
+    ip:          "10.10.30.10",
+    cpus:        4,
+    memory:      6144,
+    playbook:    "ansible/playbooks/sandbox.yml",
+    description: "CAPE/Cuckoo + INetSim isolated analysis"
+  },
+  "analyst" => {
+    box:         "ubuntu/jammy64",
+    ip:          "10.10.30.20",
+    cpus:        4,
+    memory:      6144,
+    playbook:    "ansible/playbooks/analyst-workstation.yml",
+    description: "Ghidra, r2, GDB, pwntools, Volatility3"
+  },
+  "threat-intel" => {
+    box:         "ubuntu/jammy64",
+    ip:          "10.10.30.30",
+    cpus:        2,
+    memory:      4096,
+    playbook:    "ansible/playbooks/threat-intel.yml",
+    description: "MISP + OpenCTI + TheHive"
+  },
+  "vuln-research" => {
+    box:         "ubuntu/jammy64",
+    ip:          "10.10.30.40",
+    cpus:        4,
+    memory:      4096,
+    playbook:    "ansible/playbooks/vuln-research.yml",
+    description: "AFL++, libFuzzer, ASan, GDB/pwndbg"
+  }
+}
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.ssh.insert_key = false
+  config.vm.box_check_update = false
+
+  MACHINES.each do |name, opts|
+    config.vm.define name do |node|
+      node.vm.box      = opts[:box]
+      node.vm.hostname = name.gsub("-", "")  # No hyphens in hostname
+
+      # Private lab network
+      node.vm.network "private_network", ip: opts[:ip]
+
+      # Service-specific port forwards
+      case name
+      when "threat-intel"
+        node.vm.network "forwarded_port", guest: 443,  host: 8443, host_ip: "127.0.0.1"  # MISP
+        node.vm.network "forwarded_port", guest: 9000, host: 9000, host_ip: "127.0.0.1"  # TheHive
+        node.vm.network "forwarded_port", guest: 8080, host: 8088, host_ip: "127.0.0.1"  # OpenCTI
+      when "sandbox"
+        node.vm.network "forwarded_port", guest: 8000, host: 8000, host_ip: "127.0.0.1"  # CAPE UI
+      end
+
+      node.vm.provider "virtualbox" do |vb|
+        vb.name   = "secresearch-#{name}"
+        vb.cpus   = opts[:cpus]
+        vb.memory = opts[:memory]
+        vb.gui    = false
+
+        # Sandbox must NOT reach internet — disable NAT DNS
+        if name == "sandbox"
+          vb.customize ["modifyvm", :id, "--natdnshostresolver1", "off"]
+          vb.customize ["modifyvm", :id, "--natdnsproxy1", "off"]
+        end
+
+        # Enable nested virtualisation for vuln-research (for QEMU targets)
+        if name == "vuln-research"
+          vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+        end
+      end
+
+      # Repo root always available
+      node.vm.synced_folder ".", "/vagrant", type: "virtualbox"
+
+      # Shared samples directory (read-only on sandbox for safety)
+      if name == "sandbox"
+        node.vm.synced_folder "datasets", "/datasets",
+          type: "virtualbox",
+          mount_options: ["ro"]
+      else
+        node.vm.synced_folder "datasets", "/datasets", type: "virtualbox"
+      end
+
+      # Bootstrap
+      node.vm.provision "shell", inline: <<~SHELL
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq python3 python3-pip python3-venv \
+          curl wget git build-essential 2>/dev/null || true
+        echo "Bootstrap done on #{name}: #{opts[:description]}"
+      SHELL
+
+      # Ansible provisioner
+      if opts[:playbook]
+        node.vm.provision "ansible" do |ansible|
+          ansible.playbook       = opts[:playbook]
+          ansible.inventory_path = "ansible/inventory"
+          ansible.verbose        = false
+          ansible.extra_vars     = {
+            lab_node:        name,
+            lab_network:     "10.10.30.0/24",
+            inetsim_host:    "10.10.30.10",
+            misp_host:       "10.10.30.30",
+            thehive_host:    "10.10.30.30"
+          }
+        end
+      end
+
+    end
+  end
+end

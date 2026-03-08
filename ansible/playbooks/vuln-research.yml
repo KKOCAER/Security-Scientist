@@ -1,0 +1,251 @@
+---
+# =============================================================
+#  Playbook: vuln-research.yml
+#  AFL++, libFuzzer, ASan, Valgrind, pwndbg, exploit tooling
+# =============================================================
+
+- name: Deploy Vulnerability Research Environment
+  hosts: vuln_research
+  become: true
+  vars:
+    afl_dir:     /opt/AFLplusplus
+    corpus_dir:  /opt/fuzzing/corpus
+    crashes_dir: /opt/fuzzing/crashes
+    targets_dir: /opt/fuzzing/targets
+
+  tasks:
+    # ── Compiler toolchain ────────────────────────────────────
+    - name: Install build tools and fuzzing dependencies
+      ansible.builtin.apt:
+        name:
+          - build-essential
+          - clang
+          - clang-tools
+          - llvm
+          - llvm-dev
+          - lld
+          - gcc
+          - g++
+          - gcc-multilib
+          - g++-multilib
+          - cmake
+          - make
+          - ninja-build
+          - python3
+          - python3-pip
+          - python3-dev
+          - git
+          - curl
+          - wget
+          - nasm
+          - gdb
+          - valgrind
+          - strace
+          - ltrace
+          - libssl-dev
+          - libffi-dev
+          - libpcre3-dev
+          - libpng-dev
+          - libjpeg-dev
+          - libxml2-dev
+          - screen
+          - tmux
+        state: present
+        update_cache: true
+
+    # ── AFL++ ──────────────────────────────────────────────────
+    - name: Clone AFL++
+      ansible.builtin.git:
+        repo: https://github.com/AFLplusplus/AFLplusplus.git
+        dest: "{{ afl_dir }}"
+        depth: 1
+
+    - name: Build AFL++
+      ansible.builtin.command:
+        cmd: make all
+        chdir: "{{ afl_dir }}"
+        creates: "{{ afl_dir }}/afl-fuzz"
+      environment:
+        CC:  clang
+        CXX: clang++
+
+    - name: Install AFL++ system-wide
+      ansible.builtin.command:
+        cmd: make install
+        chdir: "{{ afl_dir }}"
+      changed_when: true
+
+    # ── System config for fuzzing ──────────────────────────────
+    - name: Set core dump pattern for AFL
+      ansible.posix.sysctl:
+        name: kernel.core_pattern
+        value: "core"
+        sysctl_set: true
+
+    - name: Set CPU scaling for consistent fuzzing
+      ansible.builtin.shell:
+        cmd: |
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo performance > "$f" 2>/dev/null || true
+          done
+      changed_when: false
+
+    # ── libFuzzer test harness template ───────────────────────
+    - name: Create fuzzing workspace
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ corpus_dir }}"
+        - "{{ crashes_dir }}"
+        - "{{ targets_dir }}"
+        - /opt/fuzzing/findings
+
+    - name: Deploy fuzzing harness template
+      ansible.builtin.copy:
+        dest: "{{ targets_dir }}/harness_template.c"
+        mode: "0644"
+        content: |
+          /**
+           * libFuzzer harness template
+           * Compile: clang -g -O1 -fsanitize=address,fuzzer harness_template.c -o fuzz_target
+           * Run:     ./fuzz_target corpus/ -max_len=1024 -timeout=10
+           */
+          #include <stdint.h>
+          #include <stddef.h>
+
+          // Include your target headers here
+          // #include "target.h"
+
+          int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+              if (Size < 4) return 0;
+
+              // ── Add your fuzzing logic here ──────────────────
+              // Example: call the function under test
+              // target_parse(Data, Size);
+              // ─────────────────────────────────────────────────
+
+              return 0;
+          }
+
+    # ── AddressSanitizer / sanitizer helpers ──────────────────
+    - name: Deploy ASAN suppression file
+      ansible.builtin.copy:
+        dest: /opt/fuzzing/asan.suppressions
+        content: |
+          # ASAN leak suppression file
+          # Add known-benign leaks here
+          leak:__libc_start_main
+          leak:libdl
+        mode: "0644"
+
+    # ── GDB + pwndbg ──────────────────────────────────────────
+    - name: Clone pwndbg
+      ansible.builtin.git:
+        repo: https://github.com/pwndbg/pwndbg.git
+        dest: /opt/pwndbg
+        depth: 1
+
+    - name: Install pwndbg
+      ansible.builtin.command:
+        cmd: bash setup.sh
+        chdir: /opt/pwndbg
+      ignore_errors: true
+
+    - name: Configure GDB
+      ansible.builtin.blockinfile:
+        path: /root/.gdbinit
+        create: true
+        block: |
+          source /opt/pwndbg/gdbinit.py
+          set disassembly-flavor intel
+          set follow-fork-mode child
+
+    # ── Exploit dev tools ─────────────────────────────────────
+    - name: Install Python exploit tools
+      ansible.builtin.pip:
+        name:
+          - pwntools
+          - ROPgadget
+          - angr
+          - capstone
+          - keystone-engine
+          - unicorn
+          - checksec
+          - one_gadget
+        state: present
+
+    # ── Crash triage script ───────────────────────────────────
+    - name: Deploy crash triage helper
+      ansible.builtin.copy:
+        dest: /usr/local/bin/triage-crashes
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          """
+          Crash triage — deduplicate AFL crashes by stack hash
+          Usage: triage-crashes <target_binary> <crashes_dir>
+          """
+          import os
+          import sys
+          import subprocess
+          import hashlib
+          from pathlib import Path
+
+          def get_crash_hash(binary, crash_file):
+              """Run binary under GDB and extract backtrace hash."""
+              gdb_cmd = [
+                  "gdb", "--batch", "--quiet",
+                  "-ex", "run",
+                  "-ex", "bt 5",
+                  "-ex", "quit",
+                  "--args", binary, crash_file
+              ]
+              result = subprocess.run(gdb_cmd, capture_output=True, text=True, timeout=10)
+              bt = result.stdout + result.stderr
+              return hashlib.sha1(bt.encode()).hexdigest()[:8]
+
+          if len(sys.argv) < 3:
+              print("Usage: triage-crashes <binary> <crashes_dir>")
+              sys.exit(1)
+
+          binary     = sys.argv[1]
+          crashes    = Path(sys.argv[2])
+          seen       = {}
+
+          for crash_file in crashes.glob("id:*"):
+              try:
+                  h = get_crash_hash(binary, str(crash_file))
+                  if h not in seen:
+                      seen[h] = crash_file
+                      print(f"[UNIQUE] {h} → {crash_file.name}")
+                  else:
+                      print(f"[DUP]    {h} → {crash_file.name} (same as {seen[h].name})")
+              except Exception as e:
+                  print(f"[ERROR]  {crash_file.name}: {e}")
+
+          print(f"\n✅ {len(seen)} unique crashes out of {sum(1 for _ in crashes.glob('id:*'))} total")
+
+    # ── CVE research workspace ────────────────────────────────
+    - name: Create CVE research directory structure
+      ansible.builtin.file:
+        path: "/opt/cve-research/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - active
+        - reproduced
+        - pocs
+        - patches
+
+    - name: Show environment summary
+      ansible.builtin.debug:
+        msg:
+          - "AFL++      → afl-fuzz, afl-cc, afl-analyze"
+          - "GDB        → gdb (pwndbg loaded)"
+          - "pwntools   → python3: from pwn import *"
+          - "ROPgadget  → ROPgadget --binary <elf>"
+          - "checksec   → checksec <binary>"
+          - "Valgrind   → valgrind --leak-check=full ./target"
+          - "Crash triage → triage-crashes <binary> {{ crashes_dir }}"
